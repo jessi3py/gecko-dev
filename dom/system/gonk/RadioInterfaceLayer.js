@@ -2103,7 +2103,7 @@ RadioInterface.prototype = {
       // corresponding ApnContext.
       for each (let type in inputApnSetting.types) {
         let apnContext = new ApnContext(inputApnSetting);
-        apnContext.iface = new RILNetworkInterface(this, inputApnSetting);
+        apnContext.iface = new RILNetworkInterface(this, type, inputApnSetting);
         this.apnContexts.set(type, apnContext);
       }
     }
@@ -3727,7 +3727,7 @@ RadioInterface.prototype = {
       return;
     }
 
-    apnContext.iface.connect(apntype);
+    apnContext.iface.connect();
     // We just call connect() function, so this interface should be in
     // connecting state. If this interface is already in connected state, we
     // are sure that this interface have successfully established connection
@@ -3762,7 +3762,7 @@ RadioInterface.prototype = {
     }
     apnContext.enabled = false;
 
-    apnContext.iface.disconnect(apntype);
+    apnContext.iface.disconnect();
     // We just call disconnect() function, so this interface should be in
     // disconnecting state. If this interface is still in connected state, we
     // are sure that other data call types still need this connection of this
@@ -3822,8 +3822,9 @@ RadioInterface.prototype = {
   }
 };
 
-function RILNetworkInterface(radioInterface, apnSetting) {
+function RILNetworkInterface(radioInterface, type, apnSetting) {
   this.radioInterface = radioInterface;
+  this.apnType = type;
   this.apnSetting = apnSetting;
 
   this.connectedTypes = [];
@@ -3868,24 +3869,26 @@ RILNetworkInterface.prototype = {
   // Event timer for connection retries
   timer: null,
 
+  apnType: null,
+
   /**
    * nsINetworkInterface Implementation
    */
 
-  state: Ci.nsINetworkInterface.NETWORK_STATE_UNKNOWN,
-
   get type() {
-    if (this.connectedTypes.indexOf("default") != -1) {
-      return this.NETWORK_TYPE_MOBILE;
+    switch(this.apnType) {
+      case "default":
+        return this.NETWORK_TYPE_MOBILE;
+      case "mms":
+        return this.NETWORK_TYPE_MOBILE_MMS;
+      case "supl":
+        return this.NETWORK_TYPE_MOBILE_SUPL;
+      default:
+        return this.NETWORK_TYPE_MOBILE_OTHERS;
     }
-    if (this.connectedTypes.indexOf("mms") != -1) {
-      return this.NETWORK_TYPE_MOBILE_MMS;
-    }
-    if (this.connectedTypes.indexOf("supl") != -1) {
-      return this.NETWORK_TYPE_MOBILE_SUPL;
-    }
-    return this.NETWORK_TYPE_MOBILE_OTHERS;
   },
+
+  state: Ci.nsINetworkInterface.NETWORK_STATE_UNKNOWN,
 
   name: null,
 
@@ -3976,7 +3979,7 @@ RILNetworkInterface.prototype = {
 
   debug: function(s) {
     dump("-*- RILNetworkInterface[" + this.radioInterface.clientId + ":" +
-         this.type + "]: " + s + "\n");
+         this.apnType + "]: " + s + "\n");
   },
 
   // nsIRILDataCallback
@@ -4105,9 +4108,9 @@ RILNetworkInterface.prototype = {
     return this.state == RIL.GECKO_NETWORK_STATE_CONNECTED;
   },
 
-  connect: function(apntype) {
-    if (apntype && !this.inConnectedTypes(apntype)) {
-      this.connectedTypes.push(apntype);
+  connect: function() {
+    if (this.apnType && !this.inConnectedTypes(this.apnType)) {
+      this.connectedTypes.push(this.apnType);
     }
 
     if (this.connecting || this.connected) {
@@ -4184,8 +4187,8 @@ RILNetworkInterface.prototype = {
                                 Ci.nsITimer.TYPE_ONE_SHOT);
   },
 
-  disconnect: function(apntype) {
-    let index = this.connectedTypes.indexOf(apntype);
+  disconnect: function() {
+    let index = this.connectedTypes.indexOf(this.apnType);
     if (index != -1) {
       this.connectedTypes.splice(index, 1);
     }
