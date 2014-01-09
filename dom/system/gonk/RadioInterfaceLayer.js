@@ -762,6 +762,16 @@ CdmaIccInfo.prototype = {
   mdn: null
 };
 
+function ApnContext(apnSetting) {
+  this.apnSetting = apnSetting;
+  this.enabled = false;
+}
+ApnContext.prototype = {
+  apnSetting: null,
+  enabled: null,
+  iface: null
+};
+
 function RadioInterfaceLayer() {
   gMessageManager.init(this);
   gRadioEnabledController.init(this);
@@ -1177,15 +1187,10 @@ function RadioInterface(options) {
     roamingEnabled: false
   };
 
-  // This matrix is used to keep all the APN settings.
-  //   - |byApn| object makes it easier to get the corresponding APN setting
-  //     via a given set of APN, user name and password.
-  //   - |byType| object makes it easier to get the corresponding APN setting
-  //     via a given APN type.
-  this.apnSettings = {
-    byType: {},
-    byApn: {}
-  };
+  // This map is used to store all the apn settings and its corresponding
+  // RILNetworkInterface. The key is the apn type and the value is an ApnContext
+  // object.
+  this.apnContexts = new Map();
 
   this.supportedNetworkTypes = this.getSupportedNetworkTypes();
 
@@ -1781,9 +1786,9 @@ RadioInterface.prototype = {
     dataInfo.type = newInfo.type;
     // For the data connection, the `connected` flag indicates whether
     // there's an active data call.
-    let apnSetting = this.apnSettings.byType.default;
+    let apnContext = this.apnContexts.get("default");
     dataInfo.connected = false;
-    if (apnSetting) {
+    if (apnContext) {
       dataInfo.connected = (this.getDataCallStateByType("default") ==
                             RIL.GECKO_NETWORK_STATE_CONNECTED);
     }
@@ -1812,10 +1817,10 @@ RadioInterface.prototype = {
    */
   handleDataCallError: function(message) {
     // Notify data call error only for data APN
-    if (this.apnSettings.byType.default) {
-      let apnSetting = this.apnSettings.byType.default;
-      if (message.apn == apnSetting.apn &&
-          apnSetting.iface.inConnectedTypes("default")) {
+    let apnContext = this.apnContexts.get("default");
+    if (apnContext) {
+      if (message.apn == apnContext.apnSetting.apn &&
+          apnContext.iface.inConnectedTypes("default")) {
         gMessageManager.sendMobileConnectionMessage("RIL:DataError",
                                                     this.clientId, message);
       }
@@ -2042,13 +2047,11 @@ RadioInterface.prototype = {
 
   deactivateDataCalls: function() {
     let dataDisconnecting = false;
-    for each (let apnSetting in this.apnSettings.byApn) {
-      for each (let type in apnSetting.types) {
-        if (this.getDataCallStateByType(type) ==
-            RIL.GECKO_NETWORK_STATE_CONNECTED) {
-          this.deactivateDataCallByType(type);
-          dataDisconnecting = true;
-        }
+    for (let key of this.apnContexts) {
+      if (this.getDataCallStateByType(key) ==
+          RIL.GECKO_NETWORK_STATE_CONNECTED) {
+        this.deactivateDataCallByType(key);
+        dataDisconnecting = true;
       }
     }
 
@@ -2075,22 +2078,19 @@ RadioInterface.prototype = {
     }
 
     // Clear the cached APN settings in the RIL.
-    for each (let apnSetting in this.apnSettings.byApn) {
+    for (let [key, value] of this.apnContexts) {
       // Clear all existing connections based on APN types.
-      for each (let type in apnSetting.types) {
-        if (this.getDataCallStateByType(type) ==
-            RIL.GECKO_NETWORK_STATE_CONNECTED) {
-          this.deactivateDataCallByType(type);
-        }
+      if (this.getDataCallStateByType(key) ==
+          RIL.GECKO_NETWORK_STATE_CONNECTED) {
+        this.deactivateDataCallByType(key);
       }
-      if (apnSetting.iface.name in gNetworkManager.networkInterfaces) {
-        gNetworkManager.unregisterNetworkInterface(apnSetting.iface);
+      if (value.iface.name in gNetworkManager.networkInterfaces) {
+        gNetworkManager.unregisterNetworkInterface(value.iface);
       }
-      this.unregisterDataCallCallback(apnSetting.iface);
-      delete apnSetting.iface;
+      this.unregisterDataCallCallback(value.iface);
+      delete value.iface;
     }
-    this.apnSettings.byApn = {};
-    this.apnSettings.byType = {};
+    this.apnContexts.clear();
 
     // Cache the APN settings by APNs and by types in the RIL.
     for (let i = 0; simApnSettings[i]; i++) {
@@ -2099,39 +2099,21 @@ RadioInterface.prototype = {
         continue;
       }
 
-      // Combine APN, user name, and password as the key of |byApn| object to
-      // refer to the corresponding APN setting.
-      let apnKey = inputApnSetting.apn +
-                   (inputApnSetting.user || "") +
-                   (inputApnSetting.password || "");
-
-      if (!this.apnSettings.byApn[apnKey]) {
-        this.apnSettings.byApn[apnKey] = inputApnSetting;
-      } else {
-        this.apnSettings.byApn[apnKey].types =
-          this.apnSettings.byApn[apnKey].types.concat(inputApnSetting.types);
-      }
-
-      // Use APN type as the index of |byType| object to refer to the
-      // corresponding APN setting.
+      // Use APN type as the key of apnContexts to refer to the
+      // corresponding ApnContext.
       for each (let type in inputApnSetting.types) {
-        this.apnSettings.byType[type] = this.apnSettings.byApn[apnKey];
+        let apnContext = new ApnContext(inputApnSetting);
+        apnContext.iface = new RILNetworkInterface(this, inputApnSetting);
+        this.apnContexts.set(type, apnContext);
       }
-    }
-
-    // Create RilNetworkInterface for each APN setting that just cached.
-    for each (let apnSetting in this.apnSettings.byApn) {
-      apnSetting.iface = new RILNetworkInterface(this, apnSetting);
     }
   },
 
   anyDataConnected: function() {
-    for each (let apnSetting in this.apnSettings.byApn) {
-      for each (let type in apnSetting.types) {
-        if (this.getDataCallStateByType(type) ==
-            RIL.GECKO_NETWORK_STATE_CONNECTED) {
-          return true;
-        }
+    for (let key in this.apnContexts) {
+      if (this.getDataCallStateByType(key) ==
+          RIL.GECKO_NETWORK_STATE_CONNECTED) {
+        return true;
       }
     }
     return false;
@@ -2152,8 +2134,8 @@ RadioInterface.prototype = {
   },
 
   updateRILNetworkInterface: function() {
-    let apnSetting = this.apnSettings.byType.default;
-    if (!this.validateApnSetting(apnSetting)) {
+    let apnContext = this.apnContexts.get("default");
+    if (!apnContext || !this.validateApnSetting(apnContext.apnSetting)) {
       if (DEBUG) {
         this.debug("We haven't gotten completely the APN data.");
       }
@@ -2498,12 +2480,12 @@ RadioInterface.prototype = {
    */
   handleDataCallState: function(datacall) {
     let data = this.rilContext.data;
-    let apnSetting = this.apnSettings.byType.default;
+    let apnContext = this.apnContexts.get("default");
     let dataCallConnected =
         (datacall.state == RIL.GECKO_NETWORK_STATE_CONNECTED);
-    if (apnSetting && datacall.ifname) {
-      if (dataCallConnected && datacall.apn == apnSetting.apn &&
-          apnSetting.iface.inConnectedTypes("default")) {
+    if (apnContext && datacall.ifname) {
+      if (dataCallConnected && datacall.apn == apnContext.apnSetting.apn &&
+          apnContext.iface.inConnectedTypes("default")) {
         data.connected = dataCallConnected;
         gMessageManager.sendMobileConnectionMessage("RIL:DataInfoChanged",
                                                      this.clientId, data);
@@ -2523,19 +2505,7 @@ RadioInterface.prototype = {
     // are disconnected.
     if (datacall.state == RIL.GECKO_NETWORK_STATE_UNKNOWN &&
         gRadioEnabledController.isDeactivatingDataCalls()) {
-      let anyDataConnected = false;
-      for each (let apnSetting in this.apnSettings.byApn) {
-        for each (let type in apnSetting.types) {
-          if (this.getDataCallStateByType(type) == RIL.GECKO_NETWORK_STATE_CONNECTED) {
-            anyDataConnected = true;
-            break;
-          }
-        }
-        if (anyDataConnected) {
-          break;
-        }
-      }
-      if (!anyDataConnected) {
+      if (!anyDataConnected()) {
         if (DEBUG) this.debug("All data connections are disconnected.");
         gRadioEnabledController.finishDeactivatingDataCalls(this.clientId);
       }
@@ -2751,9 +2721,9 @@ RadioInterface.prototype = {
         this._releaseSmsHandledWakeLock();
 
         // Shutdown all RIL network interfaces
-        for each (let apnSetting in this.apnSettings.byApn) {
-          if (apnSetting.iface) {
-            apnSetting.iface.shutdown();
+        for (let [key, value] of this.apnContexts) {
+          if (value.iface) {
+            value.iface.shutdown();
           }
         }
         Services.obs.removeObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID);
@@ -2790,7 +2760,7 @@ RadioInterface.prototype = {
   // Data calls setting.
   dataCallSettings: null,
 
-  apnSettings: null,
+  apnContexts: null,
 
   // Flag to determine whether to update system clock automatically. It
   // corresponds to the "time.clock.automatic-update.enabled" setting.
@@ -2915,10 +2885,6 @@ RadioInterface.prototype = {
     this.dataCallSettings.oldEnabled = false;
     this.dataCallSettings.enabled = false;
     this.dataCallSettings.roamingEnabled = false;
-    this.apnSettings = {
-      byType: {},
-      byApn: {},
-    };
   },
 
   // nsIRadioInterface
@@ -3749,10 +3715,11 @@ RadioInterface.prototype = {
   },
 
   setupDataCallByType: function(apntype) {
-    let apnSetting = this.apnSettings.byType[apntype];
-    if (!apnSetting) {
+    let apnContext = this.apnContexts.get(apntype);
+    if (!apnContext) {
       return;
     }
+    apnContext.enabled = true;
 
     let dataInfo = this.rilContext.data;
     if (dataInfo.state != RIL.GECKO_MOBILE_CONNECTION_STATE_REGISTERED ||
@@ -3760,7 +3727,7 @@ RadioInterface.prototype = {
       return;
     }
 
-    apnSetting.iface.connect(apntype);
+    apnContext.iface.connect(apntype);
     // We just call connect() function, so this interface should be in
     // connecting state. If this interface is already in connected state, we
     // are sure that this interface have successfully established connection
@@ -3768,7 +3735,7 @@ RadioInterface.prototype = {
     // data call type. In this circumstance, we have to directly update the
     // necessary data call and interface information to RILContentHelper
     // and network manager for current data call type.
-    if (apnSetting.iface.connected) {
+    if (apnContext.iface.connected) {
       if (apntype == "default" && !dataInfo.connected) {
         dataInfo.connected = true;
         gMessageManager.sendMobileConnectionMessage("RIL:DataInfoChanged",
@@ -3777,31 +3744,32 @@ RadioInterface.prototype = {
 
       // Update the interface status via-registration if the interface has
       // already been registered in the network manager.
-      if (apnSetting.iface.name in gNetworkManager.networkInterfaces) {
-        gNetworkManager.unregisterNetworkInterface(apnSetting.iface);
+      if (apnContext.iface.name in gNetworkManager.networkInterfaces) {
+        gNetworkManager.unregisterNetworkInterface(apnContext.iface);
       }
-      gNetworkManager.registerNetworkInterface(apnSetting.iface);
+      gNetworkManager.registerNetworkInterface(apnContext.iface);
 
-      Services.obs.notifyObservers(apnSetting.iface,
+      Services.obs.notifyObservers(apnContext.iface,
                                    kNetworkInterfaceStateChangedTopic,
                                    null);
     }
   },
 
   deactivateDataCallByType: function(apntype) {
-    let apnSetting = this.apnSettings.byType[apntype];
-    if (!apnSetting) {
+    let apnContext = this.apnContexts.get(apntype);
+    if (!apnContext) {
       return;
     }
+    apnContext.enabled = false;
 
-    apnSetting.iface.disconnect(apntype);
+    apnContext.iface.disconnect(apntype);
     // We just call disconnect() function, so this interface should be in
     // disconnecting state. If this interface is still in connected state, we
     // are sure that other data call types still need this connection of this
     // interface. In this circumstance, we have to directly update the
     // necessary data call and interface information to RILContentHelper
     // and network manager for current data call type.
-    if (apnSetting.iface.connectedTypes.length && apnSetting.iface.connected) {
+    if (apnContext.iface.connectedTypes.length && apnContext.iface.connected) {
       let dataInfo = this.rilContext.data;
       if (apntype == "default" && dataInfo.connected) {
         dataInfo.connected = false;
@@ -3811,26 +3779,26 @@ RadioInterface.prototype = {
 
       // Update the interface status via-registration if the interface has
       // already been registered in the network manager.
-      if (apnSetting.iface.name in gNetworkManager.networkInterfaces) {
-        gNetworkManager.unregisterNetworkInterface(apnSetting.iface);
+      if (apnContext.iface.name in gNetworkManager.networkInterfaces) {
+        gNetworkManager.unregisterNetworkInterface(apnContext.iface);
       }
-      gNetworkManager.registerNetworkInterface(apnSetting.iface);
+      gNetworkManager.registerNetworkInterface(apnContext.iface);
 
-      Services.obs.notifyObservers(apnSetting.iface,
+      Services.obs.notifyObservers(apnContext.iface,
                                    kNetworkInterfaceStateChangedTopic,
                                    null);
     }
   },
 
   getDataCallStateByType: function(apntype) {
-    let apnSetting = this.apnSettings.byType[apntype];
-    if (!apnSetting) {
+    let apnContext = this.apnContexts.get(apntype);
+    if (!apnContext) {
        return RIL.GECKO_NETWORK_STATE_UNKNOWN;
     }
-    if (!apnSetting.iface.inConnectedTypes(apntype)) {
+    if (!apnContext.iface.inConnectedTypes(apntype)) {
       return RIL.GECKO_NETWORK_STATE_DISCONNECTED;
     }
-    return apnSetting.iface.state;
+    return apnContext.iface.state;
   },
 
   setupDataCall: function(radioTech, apn, user, passwd, chappap, pdptype) {
@@ -4094,8 +4062,8 @@ RILNetworkInterface.prototype = {
     // In case the data setting changed while the datacall was being started or
     // ended, let's re-check the setting and potentially adjust the datacall
     // state again.
-    if (this.radioInterface.apnSettings.byType.default &&
-        (this.radioInterface.apnSettings.byType.default.apn ==
+    if (this.radioInterface.apnContexts.get("default") &&
+        (this.radioInterface.apnContexts.get("default").apnSetting.apn ==
          this.apnSetting.apn)) {
       this.radioInterface.updateRILNetworkInterface();
     }
