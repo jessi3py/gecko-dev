@@ -2088,7 +2088,8 @@ RadioInterface.prototype = {
         gNetworkManager.unregisterNetworkInterface(value.iface);
       }
       this.unregisterDataCallCallback(value.iface);
-      delete value.iface;
+      value.iface.shutdown();
+      value.iface = null;
     }
     this.apnContexts.clear();
 
@@ -2732,6 +2733,8 @@ RadioInterface.prototype = {
             value.iface.shutdown();
           }
         }
+        this.apnContexts.clear();
+
         Services.obs.removeObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID);
         Services.obs.removeObserver(this, kMozSettingsChangedObserverTopic);
         Services.obs.removeObserver(this, kSysClockChangeObserverTopic);
@@ -3740,8 +3743,20 @@ RadioInterface.prototype = {
       return;
     }
     if (!dataCall) {
-      // TODO: find shareable data call here?
-      apnContext.iface.dataCall = new DataCall(this, apnContext.apnSetting);
+      for (let [key,value] of this.apnContexts) {
+        let dc = value.iface.dataCall;
+        if (dc) {
+          if (dc.canHandleApn(apnContext.apnSetting)) {
+            if (DEBUG) this.debug("Found compatible dc in type: " + key);
+            apnContext.iface.dataCall = dc;
+            break;
+          }
+        }
+      }
+      if (!apnContext.iface.dataCall) {
+        if (DEBUG) this.debug("No compatible dc found, creating one.");
+        apnContext.iface.dataCall = new DataCall(this, apnContext.apnSetting);
+      }
     }
 
     apnContext.iface.connect();
@@ -3759,16 +3774,7 @@ RadioInterface.prototype = {
                                                     this.clientId, dataInfo);
       }
 
-      // Update the interface status via-registration if the interface has
-      // already been registered in the network manager.
-      if (apnContext.iface.name in gNetworkManager.networkInterfaces) {
-        gNetworkManager.unregisterNetworkInterface(apnContext.iface);
-      }
-      gNetworkManager.registerNetworkInterface(apnContext.iface);
-
-      Services.obs.notifyObservers(apnContext.iface,
-                                   kNetworkInterfaceStateChangedTopic,
-                                   null);
+      apnContext.iface.notifyRILNetworkInterface();
     }
   },
 
@@ -3787,7 +3793,7 @@ RadioInterface.prototype = {
     // necessary data call and interface information to RILContentHelper
     // and network manager for current data call type.
     let dataCall = apnContext.iface.dataCall;
-    if (dataCall && dataCall.connectedTypes.length && dataCall.connected) {
+    if (dataCall && dataCall.connected && !dataCall.inConnectedTypes(apntype)) {
       let dataInfo = this.rilContext.data;
       if (apntype == "default" && dataInfo.connected) {
         dataInfo.connected = false;
@@ -3795,16 +3801,7 @@ RadioInterface.prototype = {
                                                     this.clientId, dataInfo);
       }
 
-      // Update the interface status via-registration if the interface has
-      // already been registered in the network manager.
-      if (apnContext.iface.name in gNetworkManager.networkInterfaces) {
-        gNetworkManager.unregisterNetworkInterface(apnContext.iface);
-      }
-      gNetworkManager.registerNetworkInterface(apnContext.iface);
-
-      Services.obs.notifyObservers(apnContext.iface,
-                                   kNetworkInterfaceStateChangedTopic,
-                                   null);
+      apnContext.iface.notifyRILNetworkInterface();
     }
   },
 
@@ -3860,7 +3857,6 @@ function DataCall(radioInterface, apnSetting) {
   this.state = RIL.NETWORK_STATE_UNKNOWN;
   this.connectedTypes = [];
 }
-
 DataCall.prototype = {
   /**
    * Standard values for the APN connection retry process
@@ -3944,12 +3940,22 @@ DataCall.prototype = {
     }
 
     this.state = datacall.state;
-    this.radioInterface.notifyRILNetworkInterfaces(this.connectedTypes);
 
+    let removedTypes;
     if (this.state == RIL.GECKO_NETWORK_STATE_DISCONNECTED ||
         this.state == RIL.GECKO_NETWORK_STATE_UNKNOWN) {
       this.cid = null;
-      this.connectedTypes = [];
+      removedTypes = this.connectedTypes.splice(0, this.connectedTypes.length);
+      if (this.registeredAsDataCallCallback) {
+        this.radioInterface.unregisterDataCallCallback(this);
+        this.registeredAsDataCallCallback = false;
+      }
+    }
+
+    if (removedTypes) {
+      this.radioInterface.notifyRILNetworkInterfaces(removedTypes);
+    } else {
+      this.radioInterface.notifyRILNetworkInterfaces(this.connectedTypes);
     }
 
     // In case the data setting changed while the datacall was being started or
@@ -3988,7 +3994,15 @@ DataCall.prototype = {
     return this.state == RIL.GECKO_NETWORK_STATE_CONNECTED;
   },
 
+  canHandleApn: function(apnSetting) {
+    // TODO: compare authtype?
+    return (this.profile.apn == apnSetting.apn &&
+            (this.profile.user || '') == (apnSetting.user || '') &&
+            (this.profile.password || '') == (apnSetting.password || ''));
+  },
+
   connect: function(apntype) {
+    if (DEBUG) this.debug("connect: " + apntype);
     if (apntype && !this.inConnectedTypes(apntype)) {
       this.connectedTypes.push(apntype);
     }
@@ -4068,20 +4082,26 @@ DataCall.prototype = {
   },
 
   disconnect: function(apntype) {
-    // TODO: remove apntype from connectedTypes after it is actually
-    // disconnected?
+    if (DEBUG) this.debug("disconnect: " + apntype);
     let index = this.connectedTypes.indexOf(apntype);
-    if (index != -1) {
-      this.connectedTypes.splice(index, 1);
+    if (index == -1) {
+      return
     }
 
-    if (this.connectedTypes.length) {
+    if (this.connectedTypes.length > 1) {
+      // This DataCall is still in use, just remove the apntype from
+      // connectedTypes and return. Reference to this DataCall will be removed
+      // when RadioInterface calls notifyRILNetworkInterface().
+      this.connectedTypes.splice(index, 1);
       return;
     }
 
     if (this.state == RIL.GECKO_NETWORK_STATE_DISCONNECTING ||
         this.state == RIL.GECKO_NETWORK_STATE_DISCONNECTED ||
         this.state == RIL.GECKO_NETWORK_STATE_UNKNOWN) {
+      if (this.timer) {
+        this.timer.cancel();
+      }
       return;
     }
     let reason = RIL.DATACALL_DEACTIVATE_NO_REASON;
@@ -4095,7 +4115,14 @@ DataCall.prototype = {
   },
 
   shutdown: function() {
-    this.timer = null;
+    if (this.registeredAsDataCallCallback) {
+      this.radioInterface.unregisterDataCallCallback(this);
+      this.registeredAsDataCallCallback = false;
+    }
+    if (this.timer) {
+      this.timer.cancel();
+      this.timer = null;
+    }
   }
 };
 
@@ -4143,6 +4170,7 @@ RILNetworkInterface.prototype = {
   /**
    * nsINetworkInterface Implementation
    */
+
   get type() {
     switch(this.apnType) {
       case "default":
@@ -4160,6 +4188,9 @@ RILNetworkInterface.prototype = {
     if (!this.dataCall) {
       // TODO: UNKNOWN or DISCONNECTED?
       return Ci.nsINetworkInterface.NETWORK_STATE_UNKNOWN;
+    }
+    if (!this.dataCall.inConnectedTypes(this.apnType)) {
+      return Ci.nsINetworkInterface.NETWORK_STATE_DISCONNECTED;
     }
     return this.dataCall.state;
   },
@@ -4290,8 +4321,6 @@ RILNetworkInterface.prototype = {
 
   // Helpers
 
-  registeredAsNetworkInterface: false,
-
   debug: function(s) {
     dump("-*- RILNetworkInterface[" + this.radioInterface.clientId + ":" +
          this.type + "]: " + s + "\n");
@@ -4305,19 +4334,34 @@ RILNetworkInterface.prototype = {
     if (DEBUG) this.debug("notifyRILNetworkInterface type: " + this.type +
       ", state: " + this.state);
 
-    if (this.connected && !this.registeredAsNetworkInterface) {
+    if (!this.dataCall) {
+      return;
+    }
+
+    if (this.connected && this.dataCall.inConnectedTypes(this.apnType) &&
+        !(this.name in gNetworkManager.networkInterfaces)) {
         gNetworkManager.registerNetworkInterface(this);
-        this.registeredAsNetworkInterface = true;
     }
 
     Services.obs.notifyObservers(this,
                                  kNetworkInterfaceStateChangedTopic,
                                  null);
 
-    if (this.state == RIL.GECKO_NETWORK_STATE_UNKNOWN &&
-        this.registeredAsNetworkInterface) {
+    // This is the case where apn type is disabled but dataCall is
+    // still in use, just remove the reference in this case.
+    if (this.dataCall.connected && !this.dataCall.inConnectedTypes(this.apnType)) {
+      if (DEBUG) this.debug("dataCall still in use, just remove reference.");
+      this.dataCall = null;
+      return;
+    }
+    // This is the case where the data call is actually disconnected,
+    // so unregister network interface and remove reference.
+    if (this.state == RIL.GECKO_NETWORK_STATE_DISCONNECTED &&
+        this.dataCall.connectedTypes.length == 0 &&
+        this.name in gNetworkManager.networkInterfaces) {
+      if (DEBUG) this.debug("No one using dataCall, unregister network iface.");
       gNetworkManager.unregisterNetworkInterface(this);
-      this.registeredAsNetworkInterface = false;
+      this.dataCall = null;
     }
   },
 
@@ -4340,6 +4384,7 @@ RILNetworkInterface.prototype = {
   shutdown: function() {
     if (this.dataCall) {
       this.dataCall.shutdown();
+      this.dataCall = null;
     }
   }
 
