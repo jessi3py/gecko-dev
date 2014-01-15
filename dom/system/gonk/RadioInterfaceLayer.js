@@ -1820,7 +1820,7 @@ RadioInterface.prototype = {
     let apnContext = this.apnContexts.get("default");
     if (apnContext) {
       if (message.apn == apnContext.apnSetting.apn &&
-          apnContext.iface.inConnectedTypes("default")) {
+          apnContext.enabled) {
         gMessageManager.sendMobileConnectionMessage("RIL:DataError",
                                                     this.clientId, message);
       }
@@ -2231,6 +2231,12 @@ RadioInterface.prototype = {
     this.setupDataCallByType("default");
   },
 
+  notifyRILNetworkInterfaces: function notifyRILNetworkInterfaces(types) {
+    for each (let type in types) {
+      this.apnContexts.get(type).iface.notifyRILNetworkInterface();
+    }
+  },
+
   /**
    * Update network selection mode
    */
@@ -2485,7 +2491,7 @@ RadioInterface.prototype = {
         (datacall.state == RIL.GECKO_NETWORK_STATE_CONNECTED);
     if (apnContext && datacall.ifname) {
       if (dataCallConnected && datacall.apn == apnContext.apnSetting.apn &&
-          apnContext.iface.inConnectedTypes("default")) {
+          apnContext.enabled) {
         data.connected = dataCallConnected;
         gMessageManager.sendMobileConnectionMessage("RIL:DataInfoChanged",
                                                      this.clientId, data);
@@ -3727,6 +3733,17 @@ RadioInterface.prototype = {
       return;
     }
 
+    let dataCall = apnContext.iface.dataCall;
+    if (dataCall && (dataCall.connecting ||
+        dataCall.state == RIL.GECKO_NETWORK_STATE_CONNECTED)) {
+      if (DEBUG) this.debug("Data call already connecting/connected.");
+      return;
+    }
+    if (!dataCall) {
+      // TODO: find shareable data call here?
+      apnContext.iface.dataCall = new DataCall(this, apnContext.apnSetting);
+    }
+
     apnContext.iface.connect();
     // We just call connect() function, so this interface should be in
     // connecting state. If this interface is already in connected state, we
@@ -3769,7 +3786,8 @@ RadioInterface.prototype = {
     // interface. In this circumstance, we have to directly update the
     // necessary data call and interface information to RILContentHelper
     // and network manager for current data call type.
-    if (apnContext.iface.connectedTypes.length && apnContext.iface.connected) {
+    let dataCall = apnContext.iface.dataCall;
+    if (dataCall && dataCall.connectedTypes.length && dataCall.connected) {
       let dataInfo = this.rilContext.data;
       if (apntype == "default" && dataInfo.connected) {
         dataInfo.connected = false;
@@ -3795,9 +3813,6 @@ RadioInterface.prototype = {
     if (!apnContext) {
        return RIL.GECKO_NETWORK_STATE_UNKNOWN;
     }
-    if (!apnContext.iface.inConnectedTypes(apntype)) {
-      return RIL.GECKO_NETWORK_STATE_DISCONNECTED;
-    }
     return apnContext.iface.state;
   },
 
@@ -3822,42 +3837,31 @@ RadioInterface.prototype = {
   }
 };
 
-function RILNetworkInterface(radioInterface, type, apnSetting) {
+function DataCall(radioInterface, apnSetting) {
   this.radioInterface = radioInterface;
-  this.apnType = type;
-  this.apnSetting = apnSetting;
 
+  this.profile = {
+    apn: apnSetting.apn,
+    user: apnSetting.user,
+    password: apnSetting.password,
+    authType: apnSetting.authtype,
+    protocol: "IP"
+  };
+  this.linkInfo = {
+    cid: null,
+    ifname: null,
+    addresses: null,
+    dnses: [],
+    gateways: null,
+    netmask: null,
+    broadcast: null
+  };
+
+  this.state = RIL.NETWORK_STATE_UNKNOWN;
   this.connectedTypes = [];
 }
 
-RILNetworkInterface.prototype = {
-  classID:   RILNETWORKINTERFACE_CID,
-  classInfo: XPCOMUtils.generateCI({classID: RILNETWORKINTERFACE_CID,
-                                    classDescription: "RILNetworkInterface",
-                                    interfaces: [Ci.nsINetworkInterface,
-                                                 Ci.nsIRilNetworkInterface,
-                                                 Ci.nsIRILDataCallback]}),
-  QueryInterface: XPCOMUtils.generateQI([Ci.nsINetworkInterface,
-                                         Ci.nsIRilNetworkInterface,
-                                         Ci.nsIRILDataCallback]),
-
-  // nsINetworkInterface
-
-  NETWORK_STATE_UNKNOWN:       Ci.nsINetworkInterface.NETWORK_STATE_UNKNOWN,
-  NETWORK_STATE_CONNECTING:    Ci.nsINetworkInterface.CONNECTING,
-  NETWORK_STATE_CONNECTED:     Ci.nsINetworkInterface.CONNECTED,
-  NETWORK_STATE_DISCONNECTING: Ci.nsINetworkInterface.DISCONNECTING,
-  NETWORK_STATE_DISCONNECTED:  Ci.nsINetworkInterface.DISCONNECTED,
-
-  NETWORK_TYPE_WIFI:        Ci.nsINetworkInterface.NETWORK_TYPE_WIFI,
-  NETWORK_TYPE_MOBILE:      Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE,
-  NETWORK_TYPE_MOBILE_MMS:  Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE_MMS,
-  NETWORK_TYPE_MOBILE_SUPL: Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE_SUPL,
-  // The network manager should only need to add the host route for "other"
-  // types, which is the same handling method as the supl type. So let the
-  // definition of other types to be the same as the one of supl type.
-  NETWORK_TYPE_MOBILE_OTHERS: Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE_SUPL,
-
+DataCall.prototype = {
   /**
    * Standard values for the APN connection retry process
    * Retry funcion: time(secs) = A * numer_of_retries^2 + B
@@ -3866,126 +3870,13 @@ RILNetworkInterface.prototype = {
   NETWORK_APNRETRY_ORIGIN: 3,
   NETWORK_APNRETRY_MAXRETRIES: 10,
 
-  // Event timer for connection retries
+  // Event timer for connection retries.
   timer: null,
-
-  apnType: null,
-
-  /**
-   * nsINetworkInterface Implementation
-   */
-
-  get type() {
-    switch(this.apnType) {
-      case "default":
-        return this.NETWORK_TYPE_MOBILE;
-      case "mms":
-        return this.NETWORK_TYPE_MOBILE_MMS;
-      case "supl":
-        return this.NETWORK_TYPE_MOBILE_SUPL;
-      default:
-        return this.NETWORK_TYPE_MOBILE_OTHERS;
-    }
-  },
-
-  state: Ci.nsINetworkInterface.NETWORK_STATE_UNKNOWN,
-
-  name: null,
-
-  ip: null,
-
-  netmask: null,
-
-  broadcast: null,
-
-  dns1: null,
-
-  dns2: null,
-
-  get httpProxyHost() {
-    return this.apnSetting.proxy || "";
-  },
-
-  get httpProxyPort() {
-    return this.apnSetting.port || "";
-  },
-
-  /**
-   * nsIRilNetworkInterface Implementation
-   */
-
-  get serviceId() {
-    return this.radioInterface.clientId;
-  },
-
-  get iccId() {
-    let iccInfo = this.radioInterface.rilContext.iccInfo;
-    return iccInfo && iccInfo.iccid;
-  },
-
-  get mmsc() {
-    if (!this.inConnectedTypes("mms")) {
-      if (DEBUG) this.debug("Error! Only MMS network can get MMSC.");
-      throw Cr.NS_ERROR_UNEXPECTED;
-    }
-
-    let mmsc = this.apnSetting.mmsc;
-    if (!mmsc) {
-      try {
-        mmsc = Services.prefs.getCharPref("ril.mms.mmsc");
-      } catch (e) {
-        mmsc = "";
-      }
-    }
-
-    return mmsc;
-  },
-
-  get mmsProxy() {
-    if (!this.inConnectedTypes("mms")) {
-      if (DEBUG) this.debug("Error! Only MMS network can get MMS proxy.");
-      throw Cr.NS_ERROR_UNEXPECTED;
-    }
-
-    let proxy = this.apnSetting.mmsproxy;
-    if (!proxy) {
-      try {
-        proxy = Services.prefs.getCharPref("ril.mms.mmsproxy");
-      } catch (e) {
-        proxy = "";
-      }
-    }
-
-    return proxy;
-  },
-
-  get mmsPort() {
-    if (!this.inConnectedTypes("mms")) {
-      if (DEBUG) this.debug("Error! Only MMS network can get MMS port.");
-      throw Cr.NS_ERROR_UNEXPECTED;
-    }
-
-    let port = this.apnSetting.mmsport;
-    if (!port) {
-      try {
-        port = Services.prefs.getIntPref("ril.mms.mmsport");
-      } catch (e) {
-        port = -1;
-      }
-    }
-
-    return port;
-  },
-
-  debug: function(s) {
-    dump("-*- RILNetworkInterface[" + this.radioInterface.clientId + ":" +
-         this.apnType + "]: " + s + "\n");
-  },
 
   // nsIRILDataCallback
 
   dataCallError: function(message) {
-    if (message.apn != this.apnSetting.apn) {
+    if (message.apn != this.profile.apn) {
       return;
     }
     if (DEBUG) this.debug("Data call error on APN: " + message.apn);
@@ -3993,7 +3884,7 @@ RILNetworkInterface.prototype = {
   },
 
   dataCallStateChanged: function(datacall) {
-    if (this.cid && this.cid != datacall.cid) {
+    if (this.linkInfo.cid && this.linkInfo.cid != datacall.cid) {
     // If data call for this connection existed but cid mismatched,
     // it means this datacall state change is not for us.
       return;
@@ -4001,7 +3892,7 @@ RILNetworkInterface.prototype = {
     // If data call for this connection does not exist, it could be state
     // change for new data call.  We only update data call state change
     // if APN name matched.
-    if (!this.cid && datacall.apn != this.apnSetting.apn) {
+    if (!this.linkInfo.cid && datacall.apn != this.profile.apn) {
       return;
     }
     if (DEBUG) {
@@ -4012,25 +3903,20 @@ RILNetworkInterface.prototype = {
         (datacall.state == RIL.GECKO_NETWORK_STATE_CONNECTING ||
          datacall.state == RIL.GECKO_NETWORK_STATE_CONNECTED)) {
       this.connecting = false;
-      this.cid = datacall.cid;
-      this.name = datacall.ifname;
-      this.ip = datacall.ip;
-      this.netmask = datacall.netmask;
-      this.broadcast = datacall.broadcast;
-      this.gateway = datacall.gw;
+      this.linkInfo.cid = datacall.cid;
+      this.linkInfo.ifname = datacall.ifname;
+      this.linkInfo.addresses = datacall.ip;
+      this.linkInfo.netmask = datacall.netmask;
+      this.linkInfo.broadcast = datacall.broadcast;
+      this.linkInfo.gateways = datacall.gw;
       if (datacall.dns) {
-        this.dns1 = datacall.dns[0];
-        this.dns2 = datacall.dns[1];
-      }
-      if (!this.registeredAsNetworkInterface) {
-        gNetworkManager.registerNetworkInterface(this);
-        this.registeredAsNetworkInterface = true;
+        this.linkInfo.dnses = datacall.dns;
       }
     }
     // In current design, we don't update status of secondary APN if it shares
     // same APN name with the default APN.  In this condition, this.cid will
     // not be set and we don't want to update its status.
-    if (this.cid == null) {
+    if (this.linkInfo.cid == null) {
       return;
     }
 
@@ -4040,47 +3926,39 @@ RILNetworkInterface.prototype = {
       }
       // State remains connected, check for minor changes.
       let changed = false;
-      if (this.gateway != datacall.gw) {
-        this.gateway = datacall.gw;
+      if (this.linkInfo.gateways != datacall.gw) {
+        this.linkInfo.gateways = datacall.gw;
         changed = true;
       }
       if (datacall.dns &&
           (this.dns1 != datacall.dns[0] ||
            this.dns2 != datacall.dns[1])) {
-        this.dns1 = datacall.dns[0];
-        this.dns2 = datacall.dns[1];
+        this.linkInfo.dnses = datacall.dns[1];
         changed = true;
       }
       if (changed) {
         if (DEBUG) this.debug("Notify for data call minor changes.");
-        Services.obs.notifyObservers(this,
-                                     kNetworkInterfaceStateChangedTopic,
-                                     null);
+        this.radioInterface.notifyRILNetworkInterfaces(this.connectedTypes);
       }
       return;
     }
 
     this.state = datacall.state;
+    this.radioInterface.notifyRILNetworkInterfaces(this.connectedTypes);
+
+    if (this.state == RIL.GECKO_NETWORK_STATE_DISCONNECTED ||
+        this.state == RIL.GECKO_NETWORK_STATE_UNKNOWN) {
+      this.cid = null;
+      this.connectedTypes = [];
+    }
 
     // In case the data setting changed while the datacall was being started or
     // ended, let's re-check the setting and potentially adjust the datacall
     // state again.
     if (this.radioInterface.apnContexts.get("default") &&
         (this.radioInterface.apnContexts.get("default").apnSetting.apn ==
-         this.apnSetting.apn)) {
+         this.profile.apn)) {
       this.radioInterface.updateRILNetworkInterface();
-    }
-
-    Services.obs.notifyObservers(this,
-                                 kNetworkInterfaceStateChangedTopic,
-                                 null);
-
-    if (this.state == RIL.GECKO_NETWORK_STATE_UNKNOWN &&
-        this.registeredAsNetworkInterface) {
-      gNetworkManager.unregisterNetworkInterface(this);
-      this.registeredAsNetworkInterface = false;
-      this.cid = null;
-      this.connectedTypes = [];
     }
   },
 
@@ -4089,16 +3967,18 @@ RILNetworkInterface.prototype = {
 
   // Helpers
 
-  cid: null,
   registeredAsDataCallCallback: false,
-  registeredAsNetworkInterface: false,
   connecting: false,
-  apnSetting: null,
 
   // APN failed connections. Retry counter
   apnRetryCounter: 0,
 
   connectedTypes: null,
+
+  debug: function debug(s) {
+    dump("-*- DataCall[" + this.radioInterface.clientId + ":" +
+         this.profile.apn + "]: " + s + "\n");
+  },
 
   inConnectedTypes: function(type) {
     return this.connectedTypes.indexOf(type) != -1;
@@ -4108,9 +3988,9 @@ RILNetworkInterface.prototype = {
     return this.state == RIL.GECKO_NETWORK_STATE_CONNECTED;
   },
 
-  connect: function() {
-    if (this.apnType && !this.inConnectedTypes(this.apnType)) {
-      this.connectedTypes.push(this.apnType);
+  connect: function(apntype) {
+    if (apntype && !this.inConnectedTypes(apntype)) {
+      this.connectedTypes.push(apntype);
     }
 
     if (this.connecting || this.connected) {
@@ -4128,30 +4008,30 @@ RILNetworkInterface.prototype = {
       this.registeredAsDataCallCallback = true;
     }
 
-    if (!this.apnSetting.apn) {
+    if (!this.profile.apn) {
       if (DEBUG) this.debug("APN name is empty, nothing to do.");
       return;
     }
 
     if (DEBUG) {
       this.debug("Going to set up data connection with APN " +
-                 this.apnSetting.apn);
+                 this.profile.apn);
     }
     let radioTechType = this.radioInterface.rilContext.data.type;
     let radioTechnology = RIL.GECKO_RADIO_TECH.indexOf(radioTechType);
-    let authType = RIL.RIL_DATACALL_AUTH_TO_GECKO.indexOf(this.apnSetting.authtype);
+    let authType = RIL.RIL_DATACALL_AUTH_TO_GECKO.indexOf(this.profile.authType);
     // Use the default authType if the value in database is invalid.
     // For the case that user might not select the authentication type.
     if (authType == -1) {
       if (DEBUG) {
-        this.debug("Invalid authType " + this.apnSetting.authtype);
+        this.debug("Invalid authType " + this.profile.authtype);
       }
       authType = RIL.RIL_DATACALL_AUTH_TO_GECKO.indexOf(RIL.GECKO_DATACALL_AUTH_DEFAULT);
     }
     this.radioInterface.setupDataCall(radioTechnology,
-                                      this.apnSetting.apn,
-                                      this.apnSetting.user,
-                                      this.apnSetting.password,
+                                      this.profile.apn,
+                                      this.profile.user,
+                                      this.profile.password,
                                       authType,
                                       "IP");
     this.connecting = true;
@@ -4187,8 +4067,10 @@ RILNetworkInterface.prototype = {
                                 Ci.nsITimer.TYPE_ONE_SHOT);
   },
 
-  disconnect: function() {
-    let index = this.connectedTypes.indexOf(this.apnType);
+  disconnect: function(apntype) {
+    // TODO: remove apntype from connectedTypes after it is actually
+    // disconnected?
+    let index = this.connectedTypes.indexOf(apntype);
     if (index != -1) {
       this.connectedTypes.splice(index, 1);
     }
@@ -4203,8 +4085,8 @@ RILNetworkInterface.prototype = {
       return;
     }
     let reason = RIL.DATACALL_DEACTIVATE_NO_REASON;
-    if (DEBUG) this.debug("Going to disconnet data connection " + this.cid);
-    this.radioInterface.deactivateDataCall(this.cid, reason);
+    if (DEBUG) this.debug("Going to disconnet data connection " + this.linkInfo.cid);
+    this.radioInterface.deactivateDataCall(this.linkInfo.cid, reason);
   },
 
   // Entry method for timer events. Used to reconnect to a failed APN
@@ -4214,6 +4096,251 @@ RILNetworkInterface.prototype = {
 
   shutdown: function() {
     this.timer = null;
+  }
+};
+
+
+function RILNetworkInterface(radioInterface, type, apnSetting) {
+  this.radioInterface = radioInterface;
+  this.apnType = type;
+  this.apnSetting = apnSetting;
+}
+
+RILNetworkInterface.prototype = {
+  classID:   RILNETWORKINTERFACE_CID,
+  classInfo: XPCOMUtils.generateCI({classID: RILNETWORKINTERFACE_CID,
+                                    classDescription: "RILNetworkInterface",
+                                    interfaces: [Ci.nsINetworkInterface,
+                                                 Ci.nsIRilNetworkInterface,
+                                                 Ci.nsIRILDataCallback]}),
+  QueryInterface: XPCOMUtils.generateQI([Ci.nsINetworkInterface,
+                                         Ci.nsIRilNetworkInterface,
+                                         Ci.nsIRILDataCallback]),
+
+  // nsINetworkInterface
+
+  NETWORK_STATE_UNKNOWN:       Ci.nsINetworkInterface.NETWORK_STATE_UNKNOWN,
+  NETWORK_STATE_CONNECTING:    Ci.nsINetworkInterface.CONNECTING,
+  NETWORK_STATE_CONNECTED:     Ci.nsINetworkInterface.CONNECTED,
+  NETWORK_STATE_DISCONNECTING: Ci.nsINetworkInterface.DISCONNECTING,
+  NETWORK_STATE_DISCONNECTED:  Ci.nsINetworkInterface.DISCONNECTED,
+
+  NETWORK_TYPE_WIFI:        Ci.nsINetworkInterface.NETWORK_TYPE_WIFI,
+  NETWORK_TYPE_MOBILE:      Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE,
+  NETWORK_TYPE_MOBILE_MMS:  Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE_MMS,
+  NETWORK_TYPE_MOBILE_SUPL: Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE_SUPL,
+  // The network manager should only need to add the host route for "other"
+  // types, which is the same handling method as the supl type. So let the
+  // definition of other types to be the same as the one of supl type.
+  NETWORK_TYPE_MOBILE_OTHERS: Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE_SUPL,
+
+  dataCall: null,
+
+  apnSetting: null,
+
+  apnType: null,
+
+  /**
+   * nsINetworkInterface Implementation
+   */
+  get type() {
+    switch(this.apnType) {
+      case "default":
+        return this.NETWORK_TYPE_MOBILE;
+      case "mms":
+        return this.NETWORK_TYPE_MOBILE_MMS;
+      case "supl":
+        return this.NETWORK_TYPE_MOBILE_SUPL;
+      default:
+        return this.NETWORK_TYPE_MOBILE_OTHERS;
+    }
+  },
+
+  get state() {
+    if (!this.dataCall) {
+      // TODO: UNKNOWN or DISCONNECTED?
+      return Ci.nsINetworkInterface.NETWORK_STATE_UNKNOWN;
+    }
+    return this.dataCall.state;
+  },
+
+  get name() {
+    if (!this.dataCall) {
+      return null;
+    }
+    return this.dataCall.linkInfo.ifname;
+  },
+
+  get ip() {
+    if (!this.dataCall) {
+      return null;
+    }
+    return this.dataCall.linkInfo.addresses;
+  },
+
+  get netmask() {
+    if (!this.dataCall) {
+      return null;
+    }
+    return this.dataCall.linkInfo.netmask;
+  },
+
+  get broadcast() {
+    if (!this.dataCall) {
+      return null;
+    }
+    return this.dataCall.linkInfo.broadcast;
+  },
+
+  get gateway() {
+    if (!this.dataCall) {
+      return null;
+    }
+    return this.dataCall.linkInfo.gateways;
+  },
+
+  get dns1() {
+    if (!this.dataCall) {
+      return null;
+    }
+    return this.dataCall.linkInfo.dnses[0];
+  },
+
+  get dns2() {
+    if (!this.dataCall) {
+      return null;
+    }
+    return this.dataCall.linkInfo.dnses[1];
+  },
+
+  get httpProxyHost() {
+    return this.apnSetting.proxy || "";
+  },
+
+  get httpProxyPort() {
+    return this.apnSetting.port || "";
+  },
+
+  /**
+   * nsIRilNetworkInterface Implementation
+   */
+
+  get serviceId() {
+    return this.radioInterface.clientId;
+  },
+
+  get iccId() {
+    let iccInfo = this.radioInterface.rilContext.iccInfo;
+    return iccInfo && iccInfo.iccid;
+  },
+
+  get mmsc() {
+    if (this.type != this.NETWORK_TYPE_MOBILE_MMS) {
+      if (DEBUG) this.debug("Error! Only MMS network can get MMSC.");
+      throw Cr.NS_ERROR_UNEXPECTED;
+    }
+
+    let mmsc = this.apnSetting.mmsc;
+    if (!mmsc) {
+      try {
+        mmsc = Services.prefs.getCharPref("ril.mms.mmsc");
+      } catch (e) {
+        mmsc = "";
+      }
+    }
+
+    return mmsc;
+  },
+
+  get mmsProxy() {
+    if (this.type != this.NETWORK_TYPE_MOBILE_MMS) {
+      if (DEBUG) this.debug("Error! Only MMS network can get MMS proxy.");
+      throw Cr.NS_ERROR_UNEXPECTED;
+    }
+
+    let proxy = this.apnSetting.mmsproxy;
+    if (!proxy) {
+      try {
+        proxy = Services.prefs.getCharPref("ril.mms.mmsproxy");
+      } catch (e) {
+        proxy = "";
+      }
+    }
+
+    return proxy;
+  },
+
+  get mmsPort() {
+    if (this.type != this.NETWORK_TYPE_MOBILE_MMS) {
+      if (DEBUG) this.debug("Error! Only MMS network can get MMS port.");
+      throw Cr.NS_ERROR_UNEXPECTED;
+    }
+
+    let port = this.apnSetting.mmsport;
+    if (!port) {
+      try {
+        port = Services.prefs.getIntPref("ril.mms.mmsport");
+      } catch (e) {
+        port = -1;
+      }
+    }
+
+    return port;
+  },
+
+  // Helpers
+
+  registeredAsNetworkInterface: false,
+
+  debug: function(s) {
+    dump("-*- RILNetworkInterface[" + this.radioInterface.clientId + ":" +
+         this.type + "]: " + s + "\n");
+  },
+
+  get connected() {
+    return this.state == RIL.GECKO_NETWORK_STATE_CONNECTED;
+  },
+
+  notifyRILNetworkInterface: function() {
+    if (DEBUG) this.debug("notifyRILNetworkInterface type: " + this.type +
+      ", state: " + this.state);
+
+    if (this.connected && !this.registeredAsNetworkInterface) {
+        gNetworkManager.registerNetworkInterface(this);
+        this.registeredAsNetworkInterface = true;
+    }
+
+    Services.obs.notifyObservers(this,
+                                 kNetworkInterfaceStateChangedTopic,
+                                 null);
+
+    if (this.state == RIL.GECKO_NETWORK_STATE_UNKNOWN &&
+        this.registeredAsNetworkInterface) {
+      gNetworkManager.unregisterNetworkInterface(this);
+      this.registeredAsNetworkInterface = false;
+    }
+  },
+
+  connect: function() {
+    if (!this.dataCall) {
+      if (DEBUG) this.debug("No dataCall on connect!");
+      return;
+    }
+    this.dataCall.connect(this.apnType);
+  },
+
+  disconnect: function() {
+    if (!this.dataCall) {
+      if (DEBUG) this.debug("No dataCall on disconnect!");
+      return;
+    }
+    this.dataCall.disconnect(this.apnType);
+  },
+
+  shutdown: function() {
+    if (this.dataCall) {
+      this.dataCall.shutdown();
+    }
   }
 
 };
